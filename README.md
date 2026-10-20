@@ -1,6 +1,6 @@
 # Options Trade Log
 
-A Pine Script v6 indicator for TradingView that provides a persistent, live-updating on-chart log for options entries derived from Elliott Wave W3 signals. Built as a paid add-on tier to the Bob EW indicator suite.
+A Pine Script v6 indicator for TradingView that provides a persistent, live-updating on-chart log for options entries derived from Elliott Wave W3 signals. Built as an indicator for TradingView.
 
 ---
 
