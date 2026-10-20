@@ -27,7 +27,7 @@ This mirrors standard card-UI patterns where the primary CTA is presented first,
 
 ### Color System
 
-The palette inherits Bob EW's exact color tokens to maintain visual continuity across a multi-indicator chart. Both indicators share the same TradingView dark theme and the same row coloring convention, so a trader's eyes never have to recalibrate when scanning between the two.
+The palette inherits the exact color tokens from another indicator I made to maintain visual continuity across a multi-indicator chart. Both indicators share the same TradingView dark theme and the same row coloring convention, so a trader's eyes never have to recalibrate when scanning between the two.
 
 | Token | Hex | Role |
 |---|---|---|
