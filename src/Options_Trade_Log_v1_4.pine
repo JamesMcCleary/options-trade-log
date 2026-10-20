@@ -1,0 +1,508 @@
+//@version=6
+// Options Trade Log v1.4
+// Changes from v1.3:
+//   [7] Options log column order: Type (CALL/PUT) now leads at col 2, Signal
+//       (W3 label) moves to col 3. Type is the primary action; Signal is context.
+//   [8] C_COMPLETE (#1B5E20) color token added to palette.
+//       TODO: apply as row bgcolor when tl_target_f is hit, replacing rbg.
+// Changes from v1.2:
+//   [6] Options Trade Log gains TF (col 12) and ETA (col 13) columns.
+//       ETA is a dynamic "X-Y hrs / days" range derived from the structure TF's
+//       W1 bar count × 1.0–1.618 projected at that TF's minutes-per-bar.
+//       Table widened 12 → 14 columns.
+// Changes from v1.1:
+//   [5] Options Trade Log now shows explicit T1 and T2 price columns (cols 10–11).
+//       tl_t1_f array added; log_entry() gains a t1_f parameter.
+//       Badges moved off Strike → T1 cell gets ✅ on hit, T2 cell gets ✅/🎯.
+//       Table widened from 10 → 12 columns; both section headers re-merged.
+// Changes from v1.0:
+//   [1] mtfW3Signal() now returns 7-tuple: added bull_w2_low, bull_w1_size,
+//       bear_w2_high, bear_w1_size so callers get actual ZigZag pivot prices.
+//   [2] All target/stop prices are now pivot-based (W2 low/high + Fib extensions
+//       of W1 size). ATR values remain as fallback until first confirmed signal.
+//   [3] Intraday score denominator fixed to /8 (was /6). bull10/bear10 defined,
+//       bull1W/bear1W added back to intraday bullCount/bearCount. maxCount=8.
+//   [4] Grade now computed directionally: _bull_grade / _bear_grade via
+//       gradeFromScore() + applyHTF(). HTF filter caps A/A+ → B+ when neither
+//       1D nor 1W is aligned. _liveGrade removed.
+indicator("Options Trade Log v1.4", shorttitle="Opt Log", overlay=false, max_bars_back=2000)
+
+// ── Color Palette (matches Bob EW) ─────────────────────────────────────────
+C_BG_SOLID = color.new(#131722, 0)
+C_LABEL_BG = color(#2A2E39)
+C_HDR_BG   = color(#1E222D)
+C_GOLD     = color(#D4AF37)
+C_BULL     = color(#089981)
+C_BEAR     = color(#F23645)
+C_HOLD     = color(#2962FF)
+C_WARN     = color(#E29400)
+C_REENTRY  = color(#00ACC1)
+C_INACTIVE = color(#5D606B)
+// TODO [v1.5]: apply C_COMPLETE as row bgcolor (replacing rbg) when tl_target_f hit
+C_COMPLETE = color(#1B5E20)
+
+// ── Inputs ─────────────────────────────────────────────────────────────────
+tradeMode      = input.string("Intraday (same day)", "Trade Mode", group="Settings", options=["Intraday (same day)", "Swing (multi-day/week)"])
+isSwing        = tradeMode == "Swing (multi-day/week)"
+
+showEntryLog   = input.bool(true,  "Show Entry Log",          group="Settings", inline="show")
+showOptLog     = input.bool(true,  "Show Options Trade Log",  group="Settings", inline="show")
+elMaxRows      = input.int(8,      "Entry Log Rows",          group="Settings", minval=1, maxval=20)
+tlMaxRows      = input.int(8,      "Trade Log Rows",          group="Settings", minval=1, maxval=20)
+tlGradeFilter  = input.bool(false, "Trade Log: A/A+ only",    group="Settings")
+elSessionFilter = input.bool(false, "Entry Log: Market hours only", group="Settings")
+logTextSize    = input.string("Small (10px)", "Text Size", group="Display", options=["Tiny (8px)","Small (10px)","Medium (12px)","Large (14px)","X-Large (18px)"])
+logPosition    = input.string("Top Right", "Table Position", group="Display", options=["Top Left","Top Center","Top Right","Middle Left","Middle Center","Middle Right","Bottom Left","Bottom Center","Bottom Right"])
+logTZ          = input.string("PT (Los Angeles)", "Timezone", group="Display", options=["ET (New York)","CT (Chicago)","MT (Denver)","PT (Los Angeles)","UTC"])
+
+// ── MTF settings (must match Bob EW) ───────────────────────────────────────
+i_hi       = input.string("high", "Price Source High", group="ZigZag", options=["high","close","max open/close"])
+i_lo       = input.string("low",  "Price Source Low",  group="ZigZag", options=["low","close","min open/close"])
+pivotLen   = input.int(5,  "Intraday Pivot Length", group="ZigZag", minval=1)
+pivotLenSw = input.int(10, "Swing Pivot Length",    group="ZigZag", minval=1)
+enableMTF  = input.bool(true, "Enable MTF Confluence", group="Performance")
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+toSize(s) => s == "Tiny (8px)" ? size.tiny : s == "Small (10px)" ? size.small : s == "Large (14px)" ? size.large : s == "X-Large (18px)" ? size.huge : size.normal
+toPos(s)  => s == "Top Left" ? position.top_left : s == "Top Center" ? position.top_center : s == "Top Right" ? position.top_right : s == "Middle Left" ? position.middle_left : s == "Middle Center" ? position.middle_center : s == "Middle Right" ? position.middle_right : s == "Bottom Left" ? position.bottom_left : s == "Bottom Center" ? position.bottom_center : position.bottom_right
+
+sz        = toSize(logTextSize)
+_pivLen   = isSwing ? pivotLenSw : pivotLen
+
+_logTZ    = logTZ == "CT (Chicago)" ? "America/Chicago" : logTZ == "MT (Denver)" ? "America/Denver" : logTZ == "PT (Los Angeles)" ? "America/Los_Angeles" : logTZ == "UTC" ? "UTC" : "America/New_York"
+_tzLabel  = logTZ == "CT (Chicago)" ? " CT" : logTZ == "MT (Denver)" ? " MT" : logTZ == "PT (Los Angeles)" ? " PT" : logTZ == "UTC" ? " UTC" : " ET"
+
+// ── Options helpers ────────────────────────────────────────────────────────
+roundTo5(px)  => math.round(px / 5.0) * 5.0
+optStrike(px, grade, isBull) =>
+    _atm  = roundTo5(px)
+    _itm1 = isBull ? _atm - 5.0 : _atm + 5.0
+    _otm1 = isBull ? _atm + 5.0 : _atm - 5.0
+    grade == "A+" or grade == "B+" ? _atm : grade == "A" ? _otm1 : _itm1
+
+nextFriday(minWeeks) =>
+    _today   = dayofmonth(time, "America/New_York")
+    _month   = month(time, "America/New_York")
+    _year    = year(time, "America/New_York")
+    _dow     = dayofweek(time, "America/New_York")
+    _daysToFri = _dow <= 6 ? 6 - _dow : 7
+    _daysOut   = _daysToFri + math.max(minWeeks - 1, 0) * 7
+    _daysOut
+
+// Session / day vars — declared before calcMinWeeks() which references them
+_g_dow         = dayofweek(time, "America/New_York")
+_g_is_friday   = _g_dow == dayofweek.friday
+_g_hour_et     = hour(time, "America/New_York")
+_g_friday_warn = _g_is_friday and _g_hour_et >= 15
+is_0dte_ticker = syminfo.ticker == "SPX" or syminfo.ticker == "SPY" or syminfo.ticker == "QQQ" or syminfo.ticker == "NQ" or syminfo.ticker == "ES" or syminfo.ticker == "NDX"
+
+calcMinWeeks() =>
+    _tf = timeframe.period
+    isSwing ? (is_0dte_ticker ? (_tf == "240" or _tf == "D" ? 6 : 4) : (_tf == "240" or _tf == "D" ? 4 : 3)) : _tf == "60" ? (_g_friday_warn ? 3 : 2) : _tf == "15" or _tf == "30" ? (_g_friday_warn ? 2 : 1) : _tf == "120" or _tf == "240" ? 3 : (_g_friday_warn ? 1 : 0)
+
+// Expiry label
+expiryLabel(daysOut) =>
+    _d = timestamp("America/New_York", year(time,"America/New_York"), month(time,"America/New_York"), dayofmonth(time,"America/New_York"), 0, 0) + daysOut * 86400000
+    str.format_time(_d, "MMM dd", "America/New_York")
+
+dte(minWeeks) => math.max(minWeeks, 0) * 7 + nextFriday(0)
+
+weeklies_note = _g_friday_warn ? (is_0dte_ticker ? "Mon 0DTE watch theta" : "Avoid current week") : timeframe.period == "15" or timeframe.period == "30" or timeframe.period == "60" ? "Avoid weeklies" : timeframe.period == "1" or timeframe.period == "5" or timeframe.period == "10" ? "Same-week ok" : "Prefer monthlies"
+expiry_short  = _g_friday_warn and is_0dte_ticker ? "Mon 0DTE" : expiryLabel(dte(calcMinWeeks()))
+friday_log   = _g_friday_warn ? "⚠️ Yes" : "No"
+
+// ── Grade helpers (directional, HTF-aware) ──────────────────────────────────
+// gradeFromScore: thresholds match Bob EW (intraday /8, swing /5)
+gradeFromScore(sc) => sc >= (isSwing ? 5 : 7) ? "A+" : sc >= (isSwing ? 4 : 6) ? "A" : sc >= (isSwing ? 3 : 4) ? "B+" : sc >= 2 ? "B" : "C"
+// applyHTF: cap A/A+ → B+ when neither 1D nor 1W is aligned with the signal
+applyHTF(g, htf_ok) => not htf_ok and (g == "A+" or g == "A") ? "B+" : g
+// etaStr: format a lo/hi minute range into a human-readable duration string.
+// W3 time projection = W1 bars × TF minutes × [1.0, 1.618].
+etaStr(lo_mins, hi_mins) =>
+    lo_h = math.ceil(lo_mins / 60.0)
+    hi_h = math.ceil(hi_mins / 60.0)
+    lo_d = math.ceil(lo_mins / 1440.0)
+    hi_d = math.ceil(hi_mins / 1440.0)
+    hi_mins < 60.0 ? str.tostring(math.round(lo_mins)) + "-" + str.tostring(math.round(hi_mins)) + " min" : hi_mins < 1440.0 ? str.tostring(lo_h) + "-" + str.tostring(hi_h) + " hrs" : str.tostring(lo_d) + "-" + str.tostring(hi_d) + " days"
+
+// ── ZigZag W3 Signal — returns 7-tuple including W2 pivot price + W1 size ──
+// [w3bull, w3bear, w1bars, bull_w2_low, bull_w1_size, bear_w2_high, bear_w1_size]
+//
+// bull_w2_low  / bear_w2_high : the W2 end pivot (structural stop reference)
+// bull_w1_size / bear_w1_size : |W1| height used for Fib target projections
+//
+// Both are `var` so they persist at their most-recent signal value; callers
+// always get the last confirmed pivot set, not na, after the first signal bar.
+mtfW3Signal() =>
+    max_bars_back(high, 2000)
+    max_bars_back(low,  2000)
+    max_bars_back(time, 2000)
+    _hi = i_hi == "high" ? high : i_hi == "close" ? close : math.max(open, close)
+    _lo = i_lo == "low"  ? low  : i_hi == "close" ? close : math.min(open, close)
+    ph = ta.pivothigh(_hi, _pivLen, 1)
+    pl = ta.pivotlow (_lo, _pivLen, 1)
+    var int   zDir = 0,  var int   zX = 0,  var float zY = 0.0
+    var int   p1x = 0,   var float p1y = 0.0
+    var int   p2x = 0,   var float p2y = 0.0
+    var int   p3x = 0,   var float p3y = 0.0
+    var int   p4x = 0,   var float p4y = 0.0
+    var int   p5x = 0,   var float p5y = 0.0
+    var int   p6x = 0,   var float p6y = 0.0
+    // Persistent pivot price refs — updated only when a new W3 signal fires
+    var float bull_w2_low  = na
+    var float bull_w1_size = na
+    var float bear_w2_high = na
+    var float bear_w1_size = na
+    curX = bar_index - 1
+    if not na(ph)
+        if zDir < 1
+            p1x:=p2x,p1y:=p2y,p2x:=p3x,p2y:=p3y,p3x:=p4x,p3y:=p4y
+            p4x:=p5x,p4y:=p5y,p5x:=p6x,p5y:=p6y
+            p6x:=curX,p6y:=nz(_hi[1]),zDir:=1,zX:=curX,zY:=nz(_hi[1])
+        else if ph > zY
+            p6x:=curX,p6y:=nz(_hi[1]),zX:=curX,zY:=nz(_hi[1])
+    if not na(pl)
+        if zDir > -1
+            p1x:=p2x,p1y:=p2y,p2x:=p3x,p2y:=p3y,p3x:=p4x,p3y:=p4y
+            p4x:=p5x,p4y:=p5y,p5x:=p6x,p5y:=p6y
+            p6x:=curX,p6y:=nz(_lo[1]),zDir:=-1,zX:=curX,zY:=nz(_lo[1])
+        else if pl < zY
+            p6x:=curX,p6y:=nz(_lo[1]),zX:=curX,zY:=nz(_lo[1])
+    w3bull = false
+    w3bear = false
+    if p3y < p4y and p5y < p4y and p6y > p4y
+        wave1 = math.abs(p4y - p3y), wave2 = math.abs(p4y - p5y)
+        retrace = wave1 > 0 ? wave2 / wave1 : 1.0
+        if retrace >= 0.382 and retrace <= 0.854
+            w3bull         := true
+            bull_w2_low    := p5y
+            bull_w1_size   := math.abs(p4y - p3y)
+    if p3y > p4y and p5y > p4y and p6y < p4y
+        wave1 = math.abs(p3y - p4y), wave2 = math.abs(p5y - p4y)
+        retrace = wave1 > 0 ? wave2 / wave1 : 1.0
+        if retrace >= 0.382 and retrace <= 0.854
+            w3bear         := true
+            bear_w2_high   := p5y
+            bear_w1_size   := math.abs(p3y - p4y)
+    w1bars = math.max(math.abs(p4x - p3x), 1)
+    [w3bull, w3bear, w1bars, bull_w2_low, bull_w1_size, bear_w2_high, bear_w1_size]
+
+// ── MTF W3 signals — 7-tuple destructure ───────────────────────────────────
+// Naming: _b{tf}  = bull signal bool,  _be{tf}  = bear signal bool
+//         _b{tf}_w2l / _b{tf}_w1s  = bull W2 low / W1 size for that TF
+//         _be{tf}_w2h / _be{tf}_w1s = bear W2 high / W1 size for that TF
+//         _w{tf}r = W1 bar count — used only for 15m (intraday ETA) and 60m (swing ETA);
+//                  held as tuple placeholders on all other TFs (Pine v6 requires full destructure)
+[_b5r,  _be5r,  _w5r,  _b5_w2l,  _b5_w1s,  _be5_w2h,  _be5_w1s ] = request.security(syminfo.tickerid, "5",   mtfW3Signal(), lookahead=barmerge.lookahead_off)
+[_b10r, _be10r, _w10r, _b10_w2l, _b10_w1s, _be10_w2h, _be10_w1s] = request.security(syminfo.tickerid, "10",  mtfW3Signal(), lookahead=barmerge.lookahead_off)
+[_b15r, _be15r, _w15r, _b15_w2l, _b15_w1s, _be15_w2h, _be15_w1s] = request.security(syminfo.tickerid, "15",  mtfW3Signal(), lookahead=barmerge.lookahead_off)  // _w15r used for intraday ETA
+[_b30r, _be30r, _w30r, _b30_w2l, _b30_w1s, _be30_w2h, _be30_w1s] = request.security(syminfo.tickerid, "30",  mtfW3Signal(), lookahead=barmerge.lookahead_off)
+[_b60r, _be60r, _w60r, _b60_w2l, _b60_w1s, _be60_w2h, _be60_w1s] = request.security(syminfo.tickerid, "60",  mtfW3Signal(), lookahead=barmerge.lookahead_off)  // _w60r used for swing ETA
+[_b240r,_be240r,_w240r,_b240_w2l,_b240_w1s,_be240_w2h,_be240_w1s]= request.security(syminfo.tickerid, "240", mtfW3Signal(), lookahead=barmerge.lookahead_off)
+[_b1Dr, _be1Dr, _w1Dr, _b1D_w2l, _b1D_w1s, _be1D_w2h, _be1D_w1s] = request.security(syminfo.tickerid, "D",   mtfW3Signal(), lookahead=barmerge.lookahead_off)
+[_b1Wr, _be1Wr, _w1Wr, _b1W_w2l, _b1W_w1s, _be1W_w2h, _be1W_w1s] = request.security(syminfo.tickerid, "W",   mtfW3Signal(), lookahead=barmerge.lookahead_off)
+
+// ── Boolean signal aliases ──────────────────────────────────────────────────
+bull5   = enableMTF and (_b5r   == true)
+bear5   = enableMTF and (_be5r  == true)
+bull10  = enableMTF and (_b10r  == true)   // was missing in v1.0 — now counted
+bear10  = enableMTF and (_be10r == true)
+bull15  = enableMTF and (_b15r  == true)
+bear15  = enableMTF and (_be15r == true)
+bull30  = enableMTF and (_b30r  == true)
+bear30  = enableMTF and (_be30r == true)
+bull60  = enableMTF and (_b60r  == true)
+bear60  = enableMTF and (_be60r == true)
+bull240 = enableMTF and (_b240r == true)
+bear240 = enableMTF and (_be240r== true)
+bull1D  = enableMTF and (_b1Dr  == true)
+bear1D  = enableMTF and (_be1Dr == true)
+bull1W  = enableMTF and (_b1Wr  == true)
+bear1W  = enableMTF and (_be1Wr == true)
+
+// ── Confluence counts ───────────────────────────────────────────────────────
+// Intraday: 8 TFs — 5m, 10m, 15m, 30m, 60m, 240m, D, W  → maxCount = 8
+// Swing:    5 TFs — 30m, 60m, 240m, D, W                  → maxCount = 5
+bullCount = isSwing ?
+     (bull30?1:0)+(bull60?1:0)+(bull240?1:0)+(bull1D?1:0)+(bull1W?1:0) :
+     (bull5?1:0)+(bull10?1:0)+(bull15?1:0)+(bull30?1:0)+(bull60?1:0)+(bull240?1:0)+(bull1D?1:0)+(bull1W?1:0)
+bearCount = isSwing ?
+     (bear30?1:0)+(bear60?1:0)+(bear240?1:0)+(bear1D?1:0)+(bear1W?1:0) :
+     (bear5?1:0)+(bear10?1:0)+(bear15?1:0)+(bear30?1:0)+(bear60?1:0)+(bear240?1:0)+(bear1D?1:0)+(bear1W?1:0)
+maxCount  = isSwing ? 5 : 8
+
+// ── Directional grade computation (HTF-aware) ───────────────────────────────
+// HTF filter: if neither 1D nor 1W is active for a direction, cap A/A+ → B+.
+// This approximates Bob EW's HTF filter without access to its internal state.
+_bull_htf_ok = bull1D or bull1W
+_bear_htf_ok = bear1D or bear1W
+_bull_grade  = applyHTF(gradeFromScore(bullCount), _bull_htf_ok)
+_bear_grade  = applyHTF(gradeFromScore(bearCount), _bear_htf_ok)
+
+// ── Volume / context ────────────────────────────────────────────────────────
+volSMA   = ta.sma(volume, 20)
+volRatio = volSMA > 0 ? volume / volSMA : 0.0
+_rvolStr = "RVOL " + str.tostring(math.round(volRatio, 1)) + "×"
+
+// ── Entry Log arrays ────────────────────────────────────────────────────────
+var string[] el_time       = array.new<string>(0)
+var string[] el_ticker     = array.new<string>(0)
+var string[] el_tf         = array.new<string>(0)
+var string[] el_action     = array.new<string>(0)
+var string[] el_grade      = array.new<string>(0)
+var string[] el_target     = array.new<string>(0)
+var string[] el_stop       = array.new<string>(0)
+var string[] el_confluence = array.new<string>(0)
+var float[]  el_t1_f       = array.new<float>(0)
+var float[]  el_target_f   = array.new<float>(0)
+var float[]  el_stop_f     = array.new<float>(0)
+
+// ── Options Trade Log arrays ────────────────────────────────────────────────
+var string[] tl_time     = array.new<string>(0)
+var string[] tl_ticker   = array.new<string>(0)
+var string[] tl_signal   = array.new<string>(0)
+var string[] tl_type     = array.new<string>(0)
+var string[] tl_strike   = array.new<string>(0)
+var string[] tl_expiry   = array.new<string>(0)
+var string[] tl_grade    = array.new<string>(0)
+var string[] tl_friday   = array.new<string>(0)
+var string[] tl_score    = array.new<string>(0)
+var string[] tl_weeklies = array.new<string>(0)
+var string[] tl_tf       = array.new<string>(0)
+var string[] tl_dur      = array.new<string>(0)
+var float[]  tl_t1_f     = array.new<float>(0)
+var float[]  tl_t2_f     = array.new<float>(0)
+var float[]  tl_target_f = array.new<float>(0)
+
+// ── Dedup guards ────────────────────────────────────────────────────────────
+var int[] _bull_logged = array.new<int>(1, -1)
+var int[] _bear_logged = array.new<int>(1, -1)
+
+// ── Log helper ──────────────────────────────────────────────────────────────
+log_entry(sig, opt, strike, expiry, grade, friday, t1_f, t2_f, target_f, score, weeklies, tf_str, dur_str) =>
+    if barstate.isconfirmed
+        ts = str.format_time(time, "HH:mm MMM dd", _logTZ) + _tzLabel
+        _gradeOK = not tlGradeFilter or grade == "A+" or grade == "A"
+        if _gradeOK
+            tl_time    .unshift(ts),      tl_ticker  .unshift(syminfo.ticker)
+            tl_signal  .unshift(sig),     tl_type    .unshift(opt)
+            tl_strike  .unshift(strike),  tl_expiry  .unshift(expiry)
+            tl_grade   .unshift(grade),   tl_friday  .unshift(friday)
+            tl_score   .unshift(score),   tl_weeklies.unshift(weeklies)
+            tl_tf      .unshift(tf_str),  tl_dur     .unshift(dur_str)
+            tl_t1_f    .unshift(t1_f),    tl_t2_f    .unshift(t2_f)
+            tl_target_f.unshift(target_f)
+            if tl_time.size() > tlMaxRows
+                tl_time.pop(), tl_ticker.pop(), tl_signal.pop(), tl_type.pop()
+                tl_strike.pop(), tl_expiry.pop(), tl_grade.pop(), tl_friday.pop()
+                tl_score.pop(), tl_weeklies.pop()
+                tl_tf.pop(), tl_dur.pop()
+                tl_t1_f.pop(), tl_t2_f.pop(), tl_target_f.pop()
+
+// ── W3 signal detection (structure TF only) ─────────────────────────────────
+// Intraday: structure = 15m,  entry = 5m
+// Swing:    structure = 60m,  entry = 30m
+_struct_bull = isSwing ? bull60  : bull15
+_struct_bear = isSwing ? bear60  : bear15
+
+var bool _prev_sbull = false
+var bool _prev_sbear = false
+_new_bull = _struct_bull and not _prev_sbull and barstate.isconfirmed
+_new_bear = _struct_bear and not _prev_sbear and barstate.isconfirmed
+_prev_sbull := _struct_bull
+_prev_sbear := _struct_bear
+
+// ── Pivot-based targets (structure TF) ─────────────────────────────────────
+// Source pivots: structure TF W2 level + W1 size for Fib extensions.
+// Targets: 1.000×W1 (T1), 1.272×W1 (T2), 1.618×W1 (full target)
+// Stop   : 0.1×W1 beyond the W2 pivot (tight structural buffer)
+// ATR fallback fires only until the first W3 signal gives us real pivots.
+_atr = ta.atr(14)
+
+_s_bull_w2 = isSwing ? _b60_w2l  : _b15_w2l    // W2 low  for structure TF bull
+_s_bull_w1 = isSwing ? _b60_w1s  : _b15_w1s    // W1 size for structure TF bull
+_s_bear_w2 = isSwing ? _be60_w2h : _be15_w2h   // W2 high for structure TF bear
+_s_bear_w1 = isSwing ? _be60_w1s : _be15_w1s   // W1 size for structure TF bear
+
+_bull_t1     = not na(_s_bull_w2) and not na(_s_bull_w1) ? _s_bull_w2 + 1.000 * _s_bull_w1 : close + 0.618 * _atr * 3
+_bull_t2     = not na(_s_bull_w2) and not na(_s_bull_w1) ? _s_bull_w2 + 1.272 * _s_bull_w1 : close + 1.000 * _atr * 3
+_bull_target = not na(_s_bull_w2) and not na(_s_bull_w1) ? _s_bull_w2 + 1.618 * _s_bull_w1 : close + 1.618 * _atr * 3
+_bull_stop   = not na(_s_bull_w2) and not na(_s_bull_w1) ? _s_bull_w2 - 0.100 * _s_bull_w1 : close - _atr * 2
+
+_bear_t1     = not na(_s_bear_w2) and not na(_s_bear_w1) ? _s_bear_w2 - 1.000 * _s_bear_w1 : close - 0.618 * _atr * 3
+_bear_t2     = not na(_s_bear_w2) and not na(_s_bear_w1) ? _s_bear_w2 - 1.272 * _s_bear_w1 : close - 1.000 * _atr * 3
+_bear_target = not na(_s_bear_w2) and not na(_s_bear_w1) ? _s_bear_w2 - 1.618 * _s_bear_w1 : close - 1.618 * _atr * 3
+_bear_stop   = not na(_s_bear_w2) and not na(_s_bear_w1) ? _s_bear_w2 + 0.100 * _s_bear_w1 : close + _atr * 2
+
+// ── Pivot-based targets (entry TF) ─────────────────────────────────────────
+// Entry Log fires at 5m (intraday) / 30m (swing), so use those TF's own pivots.
+_e_bull_w2 = isSwing ? _b30_w2l  : _b5_w2l
+_e_bull_w1 = isSwing ? _b30_w1s  : _b5_w1s
+_e_bear_w2 = isSwing ? _be30_w2h : _be5_w2h
+_e_bear_w1 = isSwing ? _be30_w1s : _be5_w1s
+
+_e_bull_t1     = not na(_e_bull_w2) and not na(_e_bull_w1) ? _e_bull_w2 + 0.618 * _e_bull_w1 : close + 0.618 * _atr * 3
+_e_bull_target = not na(_e_bull_w2) and not na(_e_bull_w1) ? _e_bull_w2 + 1.618 * _e_bull_w1 : close + 1.618 * _atr * 3
+_e_bull_stop   = not na(_e_bull_w2) and not na(_e_bull_w1) ? _e_bull_w2 - 0.100 * _e_bull_w1 : close - _atr * 2
+
+_e_bear_t1     = not na(_e_bear_w2) and not na(_e_bear_w1) ? _e_bear_w2 - 0.618 * _e_bear_w1 : close - 0.618 * _atr * 3
+_e_bear_target = not na(_e_bear_w2) and not na(_e_bear_w1) ? _e_bear_w2 - 1.618 * _e_bear_w1 : close - 1.618 * _atr * 3
+_e_bear_stop   = not na(_e_bear_w2) and not na(_e_bear_w1) ? _e_bear_w2 + 0.100 * _e_bear_w1 : close + _atr * 2
+
+// ── Entry Log detection ─────────────────────────────────────────────────────
+_entry_bull = isSwing ? bull30 : bull5
+_entry_bear = isSwing ? bear30 : bear5
+var bool _prev_ebull = false
+var bool _prev_ebear = false
+_new_entry_bull = _entry_bull and not _prev_ebull and barstate.isconfirmed
+_new_entry_bear = _entry_bear and not _prev_ebear and barstate.isconfirmed
+_prev_ebull := _entry_bull
+_prev_ebear := _entry_bear
+
+_et_h    = hour(time, "America/New_York")
+_et_m    = minute(time, "America/New_York")
+_mktOpen = (_et_h > 9 or (_et_h == 9 and _et_m >= 30)) and _et_h < 16
+
+if _new_entry_bull and (not elSessionFilter or _mktOpen) and barstate.isconfirmed
+    ts = str.format_time(time, "HH:mm MMM dd", _logTZ) + _tzLabel
+    el_time      .unshift(ts),        el_ticker    .unshift(syminfo.ticker)
+    el_tf        .unshift(isSwing ? "30m" : "5m")
+    el_action    .unshift("🟢 BUY CALL")
+    el_grade     .unshift(_bull_grade)
+    el_target    .unshift(str.tostring(math.round(_e_bull_target, 2)))
+    el_stop      .unshift(str.tostring(math.round(_e_bull_stop, 2)))
+    el_confluence.unshift(str.tostring(bullCount) + "/" + str.tostring(maxCount))
+    el_t1_f      .unshift(_e_bull_t1)
+    el_target_f  .unshift(_e_bull_target)
+    el_stop_f    .unshift(_e_bull_stop)
+    if el_time.size() > elMaxRows
+        el_time.pop(), el_ticker.pop(), el_tf.pop(), el_action.pop()
+        el_grade.pop(), el_target.pop(), el_stop.pop(), el_confluence.pop()
+        el_t1_f.pop(), el_target_f.pop(), el_stop_f.pop()
+
+if _new_entry_bear and (not elSessionFilter or _mktOpen) and barstate.isconfirmed
+    ts = str.format_time(time, "HH:mm MMM dd", _logTZ) + _tzLabel
+    el_time      .unshift(ts),        el_ticker    .unshift(syminfo.ticker)
+    el_tf        .unshift(isSwing ? "30m" : "5m")
+    el_action    .unshift("🔴 BUY PUT")
+    el_grade     .unshift(_bear_grade)
+    el_target    .unshift(str.tostring(math.round(_e_bear_target, 2)))
+    el_stop      .unshift(str.tostring(math.round(_e_bear_stop, 2)))
+    el_confluence.unshift(str.tostring(bearCount) + "/" + str.tostring(maxCount))
+    el_t1_f      .unshift(_e_bear_t1)
+    el_target_f  .unshift(_e_bear_target)
+    el_stop_f    .unshift(_e_bear_stop)
+    if el_time.size() > elMaxRows
+        el_time.pop(), el_ticker.pop(), el_tf.pop(), el_action.pop()
+        el_grade.pop(), el_target.pop(), el_stop.pop(), el_confluence.pop()
+        el_t1_f.pop(), el_target_f.pop(), el_stop_f.pop()
+
+// ── ETA + TF for options log ────────────────────────────────────────────────
+// W1 bar count comes from the structure TF's own ZigZag (15m intraday, 60m swing).
+// W3 time projection = W1 bars × [1.0, 1.618] × minutes-per-bar.
+_struct_w1bars = isSwing ? _w60r : _w15r
+_struct_tf_min = isSwing ? 60.0  : 15.0
+_eta_lo        = _struct_w1bars * _struct_tf_min
+_eta_hi        = _struct_w1bars * _struct_tf_min * 1.618
+_durStr        = etaStr(_eta_lo, _eta_hi)
+_tfStr         = isSwing ? "60m" : "15m"
+
+// ── Options Trade Log detection ─────────────────────────────────────────────
+if _new_bull and bar_index != _bull_logged.get(0)
+    _bull_logged.set(0, bar_index)
+    _strike = "$" + str.tostring(math.round(optStrike(close, _bull_grade, true)))
+    log_entry("W3 ▲ BUY", "CALL", _strike, expiry_short, _bull_grade, friday_log, _bull_t1, _bull_t2, _bull_target, str.tostring(bullCount) + "/" + str.tostring(maxCount), weeklies_note, _tfStr, _durStr)
+
+if _new_bear and bar_index != _bear_logged.get(0)
+    _bear_logged.set(0, bar_index)
+    _strikeB = "$" + str.tostring(math.round(optStrike(close, _bear_grade, false)))
+    log_entry("W3 ▼ SELL", "PUT", _strikeB, expiry_short, _bear_grade, friday_log, _bear_t1, _bear_t2, _bear_target, str.tostring(bearCount) + "/" + str.tostring(maxCount), weeklies_note, _tfStr, _durStr)
+
+// ── Draw tables ─────────────────────────────────────────────────────────────
+if barstate.islast
+    n = el_time.size()
+    m = tl_time.size()
+
+    _showEl  = showEntryLog
+    _showTl  = showOptLog
+    _elRows  = _showEl ? n + 2 : 0
+    _tlRows  = _showTl ? m + 2 : 0
+    _totRows = _elRows + _tlRows
+    if _totRows > 0
+        tbl = table.new(toPos(logPosition), 14, _totRows, border_width=1, border_color=C_LABEL_BG, bgcolor=C_BG_SOLID)
+
+        // ── Entry Log section ────────────────────────────────────────────────
+        if _showEl
+            table.cell(tbl, 0, 0, "ENTRY LOG", text_color=C_GOLD, bgcolor=C_HDR_BG, text_size=sz)
+            table.merge_cells(tbl, 0, 0, 13, 0)
+            hdrs = array.from("Time", "Ticker", "TF", "Action", "Grade", "Target", "Score", "", "", "", "", "", "", "")
+            for c = 0 to 13
+                table.cell(tbl, c, 1, hdrs.get(c), text_color=color.white, bgcolor=C_LABEL_BG, text_size=sz)
+            for i = 0 to n - 1
+                row  = i + 2
+                bull = str.contains(el_action.get(i), "CALL")
+                rbg  = bull ? color.new(C_BULL, 85) : color.new(C_BEAR, 85)
+                rclr = bull ? C_BULL : C_BEAR
+                _t1f    = el_t1_f.get(i)
+                _tgt_f  = el_target_f.get(i)
+                _stp_f  = el_stop_f.get(i)
+                _t1hit  = not na(_t1f)  and (bull ? close >= _t1f  : close <= _t1f)
+                _tgthit = not na(_tgt_f) and (bull ? close >= _tgt_f : close <= _tgt_f)
+                _stphit = not na(_stp_f) and (bull ? close <= _stp_f : close >= _stp_f)
+                _status = _tgthit ? " 🎯" : _stphit ? " 🛑" : _t1hit ? " ✅" : ""
+                table.cell(tbl, 0,  row, el_time.get(i),              text_color=rclr, bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 1,  row, el_ticker.get(i),            text_color=rclr, bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 2,  row, el_tf.get(i),                text_color=rclr, bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 3,  row, el_action.get(i),            text_color=rclr, bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 4,  row, el_grade.get(i),             text_color=rclr, bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 5,  row, el_target.get(i) + _status,  text_color=rclr, bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 6,  row, el_confluence.get(i),        text_color=rclr, bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 7,  row, "", text_color=rclr, bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 8,  row, "", text_color=rclr, bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 9,  row, "", text_color=rclr, bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 10, row, "", text_color=rclr, bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 11, row, "", text_color=rclr, bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 12, row, "", text_color=rclr, bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 13, row, "", text_color=rclr, bgcolor=rbg, text_size=sz)
+
+        // ── Options Trade Log section ────────────────────────────────────────
+        if _showTl
+            _tlOff   = _elRows
+            _tlTitle = tlGradeFilter ? "OPTIONS TRADE LOG  (A/A+ only)" : "OPTIONS TRADE LOG"
+            table.cell(tbl, 0, _tlOff, _tlTitle, text_color=C_GOLD, bgcolor=C_HDR_BG, text_size=sz)
+            table.merge_cells(tbl, 0, _tlOff, 13, _tlOff)
+            thdrs = array.from("Time", "Ticker", "Type", "Signal", "Strike", "Expiry", "Weeklies", "Fri ⚠️", "Grade", "Score", "T1", "T2", "TF", "ETA")
+            for c = 0 to 13
+                table.cell(tbl, c, _tlOff + 1, thdrs.get(c), text_color=color.white, bgcolor=C_LABEL_BG, text_size=sz)
+            for i = 0 to m - 1
+                row    = _tlOff + 2 + i
+                bull   = str.contains(tl_signal.get(i), "BUY")
+                rbg    = bull ? color.new(C_BULL, 85) : color.new(C_BEAR, 85)
+                rclr   = bull ? C_BULL : C_BEAR
+                friClr = tl_friday.get(i) == "⚠️ Yes" ? C_WARN : rclr
+                _t1f2   = tl_t1_f.get(i)
+                _t2f    = tl_t2_f.get(i)
+                _tgtf2  = tl_target_f.get(i)
+                _t1hit2 = not na(_t1f2)  and (bull ? close >= _t1f2  : close <= _t1f2)
+                _t2hit  = not na(_t2f)   and (bull ? close >= _t2f   : close <= _t2f)
+                _tghit2 = not na(_tgtf2) and (bull ? close >= _tgtf2 : close <= _tgtf2)
+                _t1_badge = _t1hit2 ? " ✅" : ""
+                _t2_badge = _tghit2 ? " 🎯" : _t2hit ? " ✅" : ""
+                _t1_str = not na(_t1f2) ? str.tostring(math.round(_t1f2, 2)) + _t1_badge : "--"
+                _t2_str = not na(_t2f)  ? str.tostring(math.round(_t2f,  2)) + _t2_badge : "--"
+                table.cell(tbl, 0,  row, tl_time    .get(i), text_color=rclr,      bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 1,  row, tl_ticker  .get(i), text_color=rclr,      bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 2,  row, tl_type    .get(i), text_color=rclr,      bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 3,  row, tl_signal  .get(i), text_color=rclr,      bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 4,  row, tl_strike  .get(i), text_color=rclr,      bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 5,  row, tl_expiry  .get(i), text_color=rclr,      bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 6,  row, tl_weeklies.get(i), text_color=rclr,      bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 7,  row, tl_friday  .get(i), text_color=friClr,    bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 8,  row, tl_grade   .get(i), text_color=rclr,      bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 9,  row, tl_score   .get(i), text_color=rclr,      bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 10, row, _t1_str,             text_color=rclr,      bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 11, row, _t2_str,             text_color=rclr,      bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 12, row, tl_tf      .get(i), text_color=C_INACTIVE, bgcolor=rbg, text_size=sz)
+                table.cell(tbl, 13, row, tl_dur     .get(i), text_color=C_INACTIVE, bgcolor=rbg, text_size=sz)
+
+plot(na)
